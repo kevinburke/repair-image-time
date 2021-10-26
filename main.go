@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jdeng/goheif"
+	"github.com/kevinburke/handlers"
 	"github.com/rwcarlsen/goexif/exif"
 )
 
@@ -24,6 +25,7 @@ Print out all files in the directory that also exist in any other of the
 directories.
 `)
 	}
+	max := flag.Int("count", 0, "Stop after processing count entries (default is to not stop)")
 	flag.Parse()
 	if flag.NArg() < 1 {
 		os.Stderr.WriteString("please provide at least one directory.\n\n")
@@ -40,7 +42,7 @@ directories.
 			if info.IsDir() {
 				return nil
 			}
-			if count > 100 {
+			if count > *max && (*max > 0) {
 				return fs.SkipDir
 			}
 			ext := filepath.Ext(path)
@@ -52,26 +54,50 @@ directories.
 				}
 				exifBytes, err := goheif.ExtractExif(fi)
 				if err != nil {
+					handlers.Logger.Warn("could not extract exif data", "path", path, "err", err)
+					return nil
+				}
+				if err := fi.Close(); err != nil {
 					return err
 				}
-				exif, err := exif.Decode(bytes.NewReader(exifBytes))
+				exifData, err := exif.Decode(bytes.NewReader(exifBytes))
 				if err != nil {
-					return err
+					return fmt.Errorf("could not decode exif data from %v: %v", path, err)
 				}
-				tag, err := exif.DateTime()
+				tag, err := exifData.DateTime()
 				if err != nil {
+					if _, ok := err.(exif.TagNotPresentError); ok {
+						// just skip it
+						return nil
+					}
+					fmt.Printf("error getting datetime: %#v\n", err)
 					return err
 				}
 				statT, ok := info.Sys().(*syscall.Stat_t)
 				if !ok {
 					return fmt.Errorf("could not cast %#v to Stat_t", info.Sys())
 				}
-				ctime := time.Unix(int64(statT.Ctimespec.Sec), int64(statT.Ctimespec.Nsec))
-				fmt.Printf("%s created at %v\n", path, ctime)
-				fmt.Printf("exif dt: %v\n", tag)
-				if err := fi.Close(); err != nil {
-					return err
+				ctime := time.Unix(int64(statT.Birthtimespec.Sec), int64(statT.Birthtimespec.Nsec))
+				if tag.IsZero() {
+					return nil
 				}
+				diff := tag.Sub(ctime)
+				if diff < 0 {
+					diff = -1 * diff
+				}
+				if diff < 24*time.Hour {
+					return nil
+				}
+				// this will update the "modification time" which, if before
+				// the "creation time" will update the creation time to the
+				// earlier date, which is the behavior we want. it's not perfect
+				// - in theory the image created time could be after the file
+				// creation time, in which case it wouldn't update, but this is
+				// better than nothing.
+				if err := os.Chtimes(path, tag, tag); err != nil {
+					return fmt.Errorf("could not update times for %v: %v", path, err)
+				}
+				handlers.Logger.Info("updated file time", "path", path, "previous_time", ctime, "new_time", tag)
 				count++
 			}
 			if strings.ToLower(ext) != ".jpg" {
