@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	jpegstructure "github.com/dsoprea/go-jpeg-image-structure"
 	"github.com/jdeng/goheif"
 	"github.com/kevinburke/handlers"
 	"github.com/rwcarlsen/goexif/exif"
@@ -51,49 +52,72 @@ directories.
 			lowerext := strings.ToLower(ext)
 			switch lowerext {
 			case ".heic", ".jpg":
+				var datetime time.Time
 				fi, err := os.Open(path)
 				if err != nil {
 					return err
 				}
 				var r io.Reader
 				if lowerext == ".heic" {
-					exifBytes, err := goheif.ExtractExif(fi)
-					if err != nil {
-						fi.Close()
-						handlers.Logger.Warn("could not extract exif data", "path", path, "err", err)
+					exifBytes, extractErr := goheif.ExtractExif(fi)
+					if err := fi.Close(); err != nil {
+						return fmt.Errorf("error closing file: %v", err)
+					}
+					if extractErr != nil {
+						handlers.Logger.Warn("could not extract exif data", "path", path, "err", extractErr)
 						return nil
 					}
 					r = bytes.NewReader(exifBytes)
 				} else {
-					r = fi
+					parser := jpegstructure.NewJpegMediaParser()
+					ec, parseErr := parser.Parse(fi, int(info.Size()))
+					if err := fi.Close(); err != nil {
+						return err
+					}
+					if parseErr != nil {
+						handlers.Logger.Warn("could not parse JPEG", "path", path, "err", parseErr)
+						return nil
+					}
+					_, segment, err := ec.(*jpegstructure.SegmentList).FindExif()
+					if err != nil {
+						if strings.Contains(err.Error(), "no exif data") {
+							// Some photos literally don't have EXIF data, it's okay!
+							handlers.Logger.Info("photo has no EXIF data, skipping", "path", path)
+							return nil
+						}
+						return fmt.Errorf("could not find EXIF data in %q: %w", path, err)
+					}
+					_, rawExif, err := segment.Exif()
+					if err != nil {
+						return err
+					}
+					r = bytes.NewReader(rawExif)
 				}
-				exifData, err := exif.Decode(r)
-				if err != nil {
-					fi.Close()
-					handlers.Logger.Warn(fmt.Sprintf("could not decode exif data from %v: %#v", path, err))
+				exifData, decodeErr := exif.Decode(r)
+				if decodeErr != nil {
+					handlers.Logger.Warn(fmt.Sprintf("could not decode exif data from %v: %#v", path, decodeErr))
 					return nil
-				}
-				if err := fi.Close(); err != nil {
-					return fmt.Errorf("error closing file: %v", err)
 				}
 				tag, err := exifData.DateTime()
 				if err != nil {
 					if _, ok := err.(exif.TagNotPresentError); ok {
 						// just skip it
+						handlers.Logger.Info("photo has no datetime info, skipping", "path", path)
 						return nil
 					}
 					fmt.Printf("error getting datetime: %#v\n", err)
 					return err
 				}
+				datetime = tag
 				statT, ok := info.Sys().(*syscall.Stat_t)
 				if !ok {
 					return fmt.Errorf("could not cast %#v to Stat_t", info.Sys())
 				}
 				ctime := time.Unix(int64(statT.Birthtimespec.Sec), int64(statT.Birthtimespec.Nsec))
-				if tag.IsZero() {
+				if datetime.IsZero() {
 					return nil
 				}
-				diff := tag.Sub(ctime)
+				diff := datetime.Sub(ctime)
 				if diff < 0 {
 					diff = -1 * diff
 				}
@@ -107,11 +131,11 @@ directories.
 				// creation time, in which case it wouldn't update, but this is
 				// better than nothing.
 				if *dryRun == false {
-					if err := os.Chtimes(path, tag, tag); err != nil {
+					if err := os.Chtimes(path, datetime, datetime); err != nil {
 						return fmt.Errorf("could not update times for %v: %v", path, err)
 					}
 				}
-				handlers.Logger.Info("updated file time", "dry_run", *dryRun, "path", path, "previous_time", ctime, "new_time", tag)
+				handlers.Logger.Info("updated file time", "dry_run", *dryRun, "path", path, "previous_time", ctime, "new_time", datetime)
 				count++
 			}
 			return nil
