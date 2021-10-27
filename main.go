@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -26,6 +27,7 @@ directories.
 `)
 	}
 	max := flag.Int("count", 0, "Stop after processing count entries (default is to not stop)")
+	dryRun := flag.Bool("dry-run", true, "Dry run mode")
 	flag.Parse()
 	if flag.NArg() < 1 {
 		os.Stderr.WriteString("please provide at least one directory.\n\n")
@@ -46,23 +48,33 @@ directories.
 				return fs.SkipDir
 			}
 			ext := filepath.Ext(path)
-			switch strings.ToLower(ext) {
-			case ".heic":
+			lowerext := strings.ToLower(ext)
+			switch lowerext {
+			case ".heic", ".jpg":
 				fi, err := os.Open(path)
 				if err != nil {
 					return err
 				}
-				exifBytes, err := goheif.ExtractExif(fi)
+				var r io.Reader
+				if lowerext == ".heic" {
+					exifBytes, err := goheif.ExtractExif(fi)
+					if err != nil {
+						fi.Close()
+						handlers.Logger.Warn("could not extract exif data", "path", path, "err", err)
+						return nil
+					}
+					r = bytes.NewReader(exifBytes)
+				} else {
+					r = fi
+				}
+				exifData, err := exif.Decode(r)
 				if err != nil {
-					handlers.Logger.Warn("could not extract exif data", "path", path, "err", err)
+					fi.Close()
+					handlers.Logger.Warn(fmt.Sprintf("could not decode exif data from %v: %#v", path, err))
 					return nil
 				}
 				if err := fi.Close(); err != nil {
-					return err
-				}
-				exifData, err := exif.Decode(bytes.NewReader(exifBytes))
-				if err != nil {
-					return fmt.Errorf("could not decode exif data from %v: %v", path, err)
+					return fmt.Errorf("error closing file: %v", err)
 				}
 				tag, err := exifData.DateTime()
 				if err != nil {
@@ -94,14 +106,13 @@ directories.
 				// - in theory the image created time could be after the file
 				// creation time, in which case it wouldn't update, but this is
 				// better than nothing.
-				if err := os.Chtimes(path, tag, tag); err != nil {
-					return fmt.Errorf("could not update times for %v: %v", path, err)
+				if *dryRun == false {
+					if err := os.Chtimes(path, tag, tag); err != nil {
+						return fmt.Errorf("could not update times for %v: %v", path, err)
+					}
 				}
-				handlers.Logger.Info("updated file time", "path", path, "previous_time", ctime, "new_time", tag)
+				handlers.Logger.Info("updated file time", "dry_run", *dryRun, "path", path, "previous_time", ctime, "new_time", tag)
 				count++
-			}
-			if strings.ToLower(ext) != ".jpg" {
-				return nil
 			}
 			return nil
 		})
