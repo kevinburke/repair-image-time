@@ -112,6 +112,7 @@ directories.
 				}
 				r = bytes.NewReader(rawExif)
 			default:
+				fi.Close()
 				// unknown file type
 				return nil
 			}
